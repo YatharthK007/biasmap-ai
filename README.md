@@ -53,7 +53,7 @@ Most AI bias tools audit models **post-hoc** (after training). **BiasMap AI** au
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/BiasMap-AI.git
+git clone https://github.com/YatharthK007/BiasMap-AI.git
 cd BiasMap-AI
 ```
 
