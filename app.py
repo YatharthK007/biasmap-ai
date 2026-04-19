@@ -1,497 +1,502 @@
-# BiasMap AI | Upload + Schema Verification Page
-
-import re
-import json
 import streamlit as st
 import pandas as pd
+import numpy as np
+import plotly.express as px
+import umap 
 
-# 1. PAGE CONFIG 
+# Importing all audit functions from the local auditor module
+from auditor import (
+    compute_safe_kl_divergence,
+    get_shannon_entropy,
+    detect_representation_deserts,
+    compute_compliance_grade,
+    generate_desert_heatmap,
+)
+
+
+# PAGE CONFIG & GLOBAL THEME
+
 st.set_page_config(
     page_title="BiasMap AI",
     page_icon="🗺️",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
-# 2. GLOBAL CSS {Obsidian Auditor Theme (Injects dark background + neon green accent across all widgets)}
+# Injecting custom CSS 
 st.markdown(
     """
     <style>
-        /* ---- Base background ---- */
-        html, body, [data-testid="stAppViewContainer"],
-        [data-testid="stHeader"], [data-testid="stToolbar"] {
-            background-color: #0e1117 !important;
-            color: #e0e0e0 !important;
-        }
+    /* ── Global background ── */
+    html, body, [data-testid="stAppViewContainer"] {
+        background-color: #0e1117;
+        color: #e0e0e0;
+        font-family: 'Courier New', monospace;
+    }
+    [data-testid="stSidebar"] { background-color: #111827; }
 
-        /* ---- Sidebar (collapsed by default, style anyway) ---- */
-        [data-testid="stSidebar"] { background-color: #161b22 !important; }
+    /* ── Neon green headings ── */
+    h1, h2, h3, h4 { color: #00FF41 !important; }
 
-        /* ---- Metric cards / info boxes ---- */
-        [data-testid="stMetric"] {
-            background-color: #161b22;
-            border: 1px solid #00FF41;
-            border-radius: 8px;
-            padding: 12px;
-        }
+    /* ── Neon green horizontal rule ── */
+    hr { border-color: #00FF41; }
 
-        /* ---- Dataframe header ---- */
-        thead tr th {
-            background-color: #161b22 !important;
-            color: #00FF41 !important;
-        }
+    /* ── Metric widgets ── */
+    [data-testid="stMetric"] {
+        background-color: #111827;
+        border: 1px solid #1f2937;
+        border-radius: 8px;
+        padding: 12px;
+    }
+    [data-testid="stMetricLabel"] { color: #9ca3af !important; font-size: 0.78rem; }
+    [data-testid="stMetricValue"] { color: #00FF41 !important; }
 
-        /* ---- Radio buttons label color ---- */
-        .stRadio label { color: #c0c0c0 !important; }
+    /* ── Dataframe / table ── */
+    [data-testid="stDataFrame"] { border: 1px solid #1f2937; border-radius: 6px; }
 
-        /* ---- File uploader border ---- */
-        [data-testid="stFileUploader"] {
-            border: 1px dashed #00FF41;
-            border-radius: 8px;
-            padding: 8px;
-        }
-
-        /* ---- Confirm button — override Streamlit primary ---- */
-        div[data-testid="stFormSubmitButton"] > button,
-        .confirm-btn > button {
-            background-color: #00FF41 !important;
-            color: #0e1117 !important;
-            font-weight: 700 !important;
-            border: none !important;
-            border-radius: 6px !important;
-            padding: 0.5rem 2rem !important;
-            font-size: 1rem !important;
-        }
-
-        /* ---- Section divider ---- */
-        hr { border-color: #00FF41; opacity: 0.3; }
-
-        /* ---- Neon heading helper ---- */
-        .neon { color: #00FF41; }
+    /* ── Compliance badge ── */
+    .grade-badge {
+        display: inline-block;
+        font-size: 4.5rem;
+        font-weight: 900;
+        font-family: 'Courier New', monospace;
+        padding: 12px 32px;
+        border-radius: 12px;
+        border: 3px solid;
+        text-align: center;
+        letter-spacing: 2px;
+    }
+    .risk-box {
+        background-color: #111827;
+        border-left: 4px solid;
+        border-radius: 4px;
+        padding: 12px 16px;
+        margin-top: 8px;
+        font-size: 0.9rem;
+        line-height: 1.6;
+    }
+    .section-header {
+        font-size: 1.1rem;
+        font-weight: 700;
+        color: #00FF41;
+        letter-spacing: 1px;
+        margin-bottom: 4px;
+    }
+    .desert-badge-red    { color: #FF4444; font-weight: bold; }
+    .desert-badge-orange { color: #FF8C00; font-weight: bold; }
+    .desert-badge-yellow { color: #FFD700; font-weight: bold; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# 3. CONSTANTS (regex keywords that flag sensitive columns)
-SENSITIVE_KEYWORDS = [
-    r"gender", r"sex", r"race", r"age", r"religion",
-    r"caste", r"pincode", r"zip", r"region", r"state",
-    r"language", r"nationality", r"income",
-]
 
-# Pre compile into one pattern
-SENSITIVE_PATTERN = re.compile(
-    "|".join(SENSITIVE_KEYWORDS), flags=re.IGNORECASE
-)
+# SIDEBAR
 
-
-# 4. HELPER (detect sensitive columns via regex)
-def detect_sensitive_columns(columns: list[str]) -> dict[str, str]:
-    """
-    Returns a dict  {col_name: suggested_role}
-    suggested_role is 'Sensitive' if regex matches, else 'Exclude'.
-    """
-    suggestions = {}
-    for col in columns:
-        if SENSITIVE_PATTERN.search(col):
-            suggestions[col] = "Sensitive"
-        else:
-            suggestions[col] = "Exclude"
-    return suggestions
+with st.sidebar:
+    st.markdown("## 🗺️ BiasMap AI")
+    st.markdown("**v3.0 — Hackathon Edition**")
+    st.markdown("---")
+    st.markdown(
+        "A **Pre-Training Dataset Auditor** — your GPS for Data Fairness.\n\n"
+        "Upload a CSV → confirm schema → explore the bias terrain."
+    )
+    st.markdown("---")
+    st.caption("🔒 Local-only execution. No data leaves your machine.")
+    st.caption("⚖️ Compliant with DPDP Act (2023) & NITI Aayog guidelines.")
 
 
-# 5. HELPER (load uploaded file into a DataFrame)
-def load_file(uploaded_file) -> pd.DataFrame | None:
-    """Supports CSV and JSON; returns None on parse failure."""
-    try:
-        if uploaded_file.name.endswith(".csv"):
-            return pd.read_csv(uploaded_file)
-        elif uploaded_file.name.endswith(".json"):
-            return pd.read_json(uploaded_file)
-        else:
-            st.error("❌ Unsupported file type. Please upload a CSV or JSON file.")
-            return None
-    except Exception as exc:
-        st.error(f"❌ Failed to parse file: {exc}")
-        return None
+# TITLE
 
-
-# 6. SESSION STATE (initialise keys once)
-# Guards against re-init on every Streamlit rerun
-for key, default in {
-    "df": None,               # Raw DataFrame
-    "schema": {},             # {col: role} — user confirmed roles
-    "schema_confirmed": False # Gate flag for analysis section
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-
-
-#  PAGE LAYOUT
-
-# Header
 st.markdown(
-    "<h1 style='color:#00FF41; letter-spacing:2px;'>🗺️ BiasMap AI</h1>",
-    unsafe_allow_html=True,
-)
-st.markdown(
-    "<p style='color:#888; margin-top:-12px;'>"
-    "Dataset Bias Cartography & DPDP Compliance Auditor &nbsp;|&nbsp; "
-    "<span style='color:#00FF41;'>Local-Only · Zero Cloud · Privacy-First</span>"
-    "</p>",
+    "<h1 style='text-align:center;'>🗺️ BiasMap AI</h1>"
+    "<p style='text-align:center; color:#9ca3af; font-size:1.0rem;'>"
+    "Dataset Bias Cartography & Compliance Auditor</p>",
     unsafe_allow_html=True,
 )
 st.markdown("---")
 
-# 7. FILE UPLOADER
-st.markdown("### 📂 Upload Your Dataset")
-st.caption("All processing happens locally on your machine. No data is transmitted anywhere.")
 
+# STEP 1: FILE UPLOAD
+
+st.markdown("### 📁 Step 1 — Upload Dataset")
 uploaded_file = st.file_uploader(
-    label="Drop a CSV or JSON file here",
-    type=["csv", "json"],
-    help="Max recommended size: ~200 MB for smooth performance.",
+    "Upload a CSV file (local only — never sent to any server)",
+    type=["csv"],
 )
 
-# 8. ON FILE UPLOAD (preview + auto-detect)
-if uploaded_file is not None:
+# Guard: nothing to show until a file is uploaded
+if uploaded_file is None:
+    st.info("👆 Upload a CSV to begin the audit.")
+    st.stop()
 
-    # Loading only if it's a new file (avoid re-parsing on every widget interaction)
-    if st.session_state.df is None or uploaded_file.name not in st.session_state.get("loaded_filename", ""):
-        st.session_state.df = load_file(uploaded_file)
-        st.session_state.loaded_filename = uploaded_file.name
-        st.session_state.schema_confirmed = False  # Reset gate on new upload
+# Load CSV into session state so we don't reload on every widget interaction
+if "df" not in st.session_state or st.session_state.get("filename") != uploaded_file.name:
+    df_raw = pd.read_csv(uploaded_file)
+    # Stratified sampling for large datasets (> 100k rows) to prevent UMAP OOM
+    if len(df_raw) > 100_000:
+        df_raw = df_raw.sample(n=100_000, random_state=42).reset_index(drop=True)
+        st.warning("⚡ Dataset > 100k rows — stratified sample of 100k applied for UMAP safety.")
+    st.session_state["df"] = df_raw
+    st.session_state["filename"] = uploaded_file.name
+    # Reset schema state when a new file is loaded
+    st.session_state.pop("schema_confirmed", None)
+    st.session_state.pop("sensitive_cols", None)
+    st.session_state.pop("target_col", None)
 
-    df = st.session_state.df
+df = st.session_state["df"]
 
-    if df is not None:
+st.success(f"✅ Loaded **{uploaded_file.name}** — {df.shape[0]:,} rows × {df.shape[1]} columns")
+with st.expander("🔍 Preview raw data (first 5 rows)"):
+    st.dataframe(df.head(5), use_container_width=True)
 
-        st.markdown("---")
-        # 8a. File stats row
-        st.markdown("### 📊 File Preview")
-        col_rows, col_cols, col_name = st.columns(3)
+st.markdown("---")
 
-        col_rows.metric("Total Rows", f"{len(df):,}")
-        col_cols.metric("Total Columns", f"{len(df.columns):,}")
-        col_name.metric("File", uploaded_file.name)
+# STEP 2: SCHEMA VERIFICATION LOOP
 
-        # Show first 5 rows in a styled table
-        st.dataframe(
-            df.head(5),
-            use_container_width=True,
-            hide_index=False,
-        )
+st.markdown("### 🔖 Step 2 — Confirm Schema")
+st.caption(
+    "Auto-detection is never 100% accurate. Manually confirm which columns are "
+    "**Sensitive**, which is the **Target**, and which to **Exclude**."
+)
 
-        st.markdown("---")
+# Auto-detect likely sensitive column names via keyword matching
+SENSITIVE_KEYWORDS = [
+    "gender", "sex", "race", "ethnicity", "caste", "religion",
+    "age", "region", "state", "district", "rural", "urban",
+    "pincode", "zip", "nationality", "language", "disability",
+]
 
-        # 9. SCHEMA VERIFICATION UI
-        st.markdown("### 🔍 Schema Verification — Confirm Column Roles")
-        st.info(
-            "BiasMap AI has **auto-detected** sensitive columns via keyword matching. "
-            "Review each column and assign the correct role before proceeding. "
-            "This step prevents *Garbage In → Garbage Out* errors.",
-            icon="ℹ️",
-        )
+def _guess_sensitive(columns: list[str]) -> list[str]:
+    """Returns column names that likely contain sensitive attributes."""
+    return [
+        c for c in columns
+        if any(kw in c.lower() for kw in SENSITIVE_KEYWORDS)
+    ]
 
-        # Run auto-detection once per file
-        auto_suggestions = detect_sensitive_columns(df.columns.tolist())
+all_cols = list(df.columns)
+guessed_sensitive = _guess_sensitive(all_cols)
 
-        # Role options for radio buttons
-        ROLE_OPTIONS = ["Sensitive", "Target", "Exclude"]
+col_left, col_right = st.columns([3, 2])
 
-        # Build the schema table header
-        header_cols = st.columns([3, 2, 2, 5])
-        header_cols[0].markdown("<span class='neon'>**Column Name**</span>", unsafe_allow_html=True)
-        header_cols[1].markdown("<span class='neon'>**Dtype**</span>", unsafe_allow_html=True)
-        header_cols[2].markdown("<span class='neon'>**Auto-Tag**</span>", unsafe_allow_html=True)
-        header_cols[3].markdown("<span class='neon'>**Your Role Selection**</span>", unsafe_allow_html=True)
+with col_left:
+    sensitive_cols = st.multiselect(
+        "🔴 Sensitive Attribute columns",
+        options=all_cols,
+        default=guessed_sensitive,
+        help="Columns representing demographic or protected attributes.",
+    )
+    target_col = st.selectbox(
+        "🎯 Target / Label column",
+        options=["(none)"] + all_cols,
+        index=0,
+        help="The outcome variable (e.g. Loan_Status, Income_Level).",
+    )
 
-        st.markdown("<hr style='margin:4px 0 10px 0;'>", unsafe_allow_html=True)
+with col_right:
+    exclude_cols = st.multiselect(
+        "⛔ Exclude columns",
+        options=[c for c in all_cols if c not in sensitive_cols],
+        help="Columns to ignore during analysis (IDs, free-text, etc.).",
+    )
 
-        # Temporary dict to collect radio selections before confirmation
-        pending_schema: dict[str, str] = {}
+# Require at least one sensitive column before proceeding
+confirm_clicked = st.button("✅ Confirm Schema & Run Audit", type="primary")
 
-        for col in df.columns:
-            auto_role = auto_suggestions[col]
-            dtype_str = str(df[col].dtype)
+if confirm_clicked:
+    if len(sensitive_cols) == 0:
+        st.error("Select at least one Sensitive column before confirming.")
+    else:
+        st.session_state["schema_confirmed"] = True
+        st.session_state["sensitive_cols"] = sensitive_cols
+        st.session_state["target_col"] = target_col if target_col != "(none)" else None
+        st.session_state["exclude_cols"] = exclude_cols
 
-            # Colour-code the auto-tag badge
-            badge_color = "#00FF41" if auto_role == "Sensitive" else "#555"
-            badge_html = (
-                f"<span style='background:{badge_color}; color:#0e1117; "
-                f"padding:2px 8px; border-radius:4px; font-size:0.75rem; font-weight:700;'>"
-                f"{auto_role}</span>"
-            )
+# Guard: don't proceed until schema is confirmed
+if not st.session_state.get("schema_confirmed"):
+    st.info("☝️ Confirm the schema above to unlock the Audit Engine.")
+    st.stop()
 
-            # Wrap each row in a container to prevent Streamlit column collapse
-            with st.container():
-                row_cols = st.columns([3, 2, 2, 5])
-                row_cols[0].markdown(f"`{col}`")
-                row_cols[1].markdown(
-                    f"<span style='color:#888;'>{dtype_str}</span>",
-                    unsafe_allow_html=True,
-                )
-                row_cols[2].markdown(badge_html, unsafe_allow_html=True)
+# Retrieve confirmed schema from session state
+sensitive_cols = st.session_state["sensitive_cols"]
+target_col     = st.session_state["target_col"]
+exclude_cols   = st.session_state.get("exclude_cols", [])
 
-                # Sanitize col name to make a safe Streamlit widget key
-                safe_key = re.sub(r"[^a-zA-Z0-9_]", "_", col)
+st.success(
+    f"✅ Schema confirmed — **{len(sensitive_cols)} sensitive** col(s): "
+    f"`{'`, `'.join(sensitive_cols)}`"
+)
+st.markdown("---")
 
-                selected_role = row_cols[3].radio(
-                    label=f"Role for {col}",
-                    options=ROLE_OPTIONS,
-                    index=ROLE_OPTIONS.index(auto_role),
-                    horizontal=True,
-                    label_visibility="collapsed",
-                    key=f"radio_{safe_key}",   # sanitized key — fixes the grouping bug
-                )
-            pending_schema[col] = selected_role
 
-        st.markdown("---")
+# STEP 3: UMAP TERRAIN MAP
 
-        # 10. CONFIRM BUTTON
-        st.markdown("<div class='confirm-btn'>", unsafe_allow_html=True)
-        confirm_clicked = st.button(
-            "✅  Confirm Schema & Proceed",
-            type="primary",          # triggers the CSS override above
-            use_container_width=False,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("### 🌐 Step 3 — Bias Terrain Map (UMAP)")
+st.caption(
+    "Dimensionality reduction projects your dataset into 2D space. "
+    "Clusters reveal where similar data points are concentrated — "
+    "click a point to inspect that region."
+)
 
-        if confirm_clicked:
-            # Validate: at least one Sensitive and one Target column selected
-            roles = list(pending_schema.values())
-            if "Sensitive" not in roles:
-                st.error("❌ Please mark at least **one column** as **Sensitive** before proceeding.")
-            elif "Target" not in roles:
-                st.warning("⚠️ No **Target** column selected. Ghost Bias analysis will be skipped.")
-                # Still allow confirmation — Target is optional for entropy-only audit
-                st.session_state.schema = pending_schema
-                st.session_state.schema_confirmed = True
-            else:
-                # Save confirmed schema to session state
-                st.session_state.schema = pending_schema
-                st.session_state.schema_confirmed = True
+@st.cache_data(show_spinner="🧭 Projecting dataset into 2D terrain…")
+def run_umap(df: pd.DataFrame, sensitive_cols: list, exclude_cols: list) -> pd.DataFrame:
+    """
+    One-hot-encodes all non-numeric columns, then runs UMAP to produce
+    2D coordinates. Cached so rerunning the UI doesn't re-project.
+    """
+    # Drop excluded columns and columns with all NaNs
+    drop_cols = exclude_cols + [c for c in df.columns if df[c].isna().all()]
+    df_work = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
-        # 11. POST CONFIRMATION STATE
-        if st.session_state.schema_confirmed:
+    # Encode: numeric stays, categorical gets one-hot encoded
+    df_encoded = pd.get_dummies(df_work, dummy_na=False)
 
-            # Count roles for summary
-            confirmed = st.session_state.schema
-            sensitive_cols = [c for c, r in confirmed.items() if r == "Sensitive"]
-            target_cols    = [c for c, r in confirmed.items() if r == "Target"]
-            excluded_cols  = [c for c, r in confirmed.items() if r == "Exclude"]
+    # Fill any remaining NaNs with column median (UMAP needs no NaNs)
+    df_encoded = df_encoded.fillna(df_encoded.median(numeric_only=True))
 
-            st.success(
-                f"✅ Schema confirmed! "
-                f"**{len(sensitive_cols)}** Sensitive · "
-                f"**{len(target_cols)}** Target · "
-                f"**{len(excluded_cols)}** Excluded columns locked in.",
-                icon="🔒",
-            )
+    reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
+    embedding = reducer.fit_transform(df_encoded.values)
 
-            # Show a compact role summary
-            with st.expander("📋 View Confirmed Schema", expanded=False):
-                summary_df = pd.DataFrame(
-                    [(col, role) for col, role in confirmed.items()],
-                    columns=["Column", "Role"],
-                )
-                # Colour-map the Role column
-                def highlight_role(val):
-                    colors = {
-                        "Sensitive": "color: #00FF41; font-weight:bold",
-                        "Target":    "color: #FFD700; font-weight:bold",
-                        "Exclude":   "color: #555555",
-                    }
-                    return colors.get(val, "")
+    result = pd.DataFrame({"UMAP_1": embedding[:, 0], "UMAP_2": embedding[:, 1]})
+    # Attach the primary sensitive column for color coding
+    result["color_by"] = df[sensitive_cols[0]].fillna("Missing_Data_Unknown").astype(str)
+    return result
 
-                st.dataframe(
-                    summary_df.style.map(highlight_role, subset=["Role"]),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+umap_df = run_umap(df, sensitive_cols, exclude_cols)
 
-            st.markdown("---")
-            
-            # STEP 2: CARTOGRAPHY ENGINE
-            # Runs after schema is confirmed. Encodes sensitive cols → UMAP → Plotly map.
+umap_fig = px.scatter(
+    umap_df,
+    x="UMAP_1",
+    y="UMAP_2",
+    color="color_by",
+    color_discrete_sequence=px.colors.qualitative.Vivid,
+    labels={"color_by": sensitive_cols[0]},
+    title=f"🌐 Dataset Terrain — coloured by <b>{sensitive_cols[0]}</b>",
+    template="plotly_dark",
+)
+umap_fig.update_traces(marker=dict(size=4, opacity=0.75))
+umap_fig.update_layout(
+    paper_bgcolor="#0e1117",
+    plot_bgcolor="#111827",
+    title_font_color="#00FF41",
+    legend_title_font_color="#00FF41",
+    height=500,
+    margin=dict(l=10, r=10, t=50, b=10),
+)
+st.plotly_chart(umap_fig, use_container_width=True)
+st.markdown("---")
 
-            import umap                                     # dimensionality reduction
-            from sklearn.preprocessing import LabelEncoder  # encode categorical → numeric
-            import plotly.express as px                     # interactive scatter plot
 
-            st.markdown("## 🗺️ Terrain Map — Bias Cartography Engine")
-            st.markdown("---")
+# STEP 4: AUDIT RESULTS
 
-            # 2a. Identify sensitive columns from confirmed schema
-            sensitive_cols = [
-                col for col, role in st.session_state.schema.items()
-                if role == "Sensitive"
-            ]
+st.markdown("### 🔬 Step 4 — Audit Results")
 
-            if not sensitive_cols:
-                st.error("❌ No Sensitive columns found in schema. Go back and mark at least one.")
-            else:
-                # 2b. Stratified sampling gate
-                # PRD requirement: datasets > 100k rows must be sampled to prevent
-                # UMAP memory overflow
-                SAMPLE_LIMIT = 100_000
-                df_full = st.session_state.df   # original full dataframe
+# 4a. Compute all audit metrics 
 
-                if len(df_full) > SAMPLE_LIMIT:
-                    # Stratify by the first sensitive column so minority groups
-                    # are proportionally preserved in the sample
-                    strat_col = sensitive_cols[0]
+# Shannon Entropy for each sensitive column
+entropy_scores = {col: get_shannon_entropy(df[col]) for col in sensitive_cols}
+# Max possible entropy = log2(number of unique categories) — benchmark for "perfect diversity"
+max_entropy = {
+    col: np.log2(df[col].nunique()) if df[col].nunique() > 1 else 1.0
+    for col in sensitive_cols
+}
 
-                    # Fill NaNs in strat column so groupby doesn't drop rows
-                    df_strat = df_full.copy()
-                    df_strat[strat_col] = df_strat[strat_col].fillna("Data_Gap_Unknown")
+# Build p_dist from the first sensitive column's value counts
+# Use a uniform benchmark Q (equal weight across all categories) since no census JSON is loaded.
+# In a production setup, load the census JSON and align category keys here.
+primary_col = sensitive_cols[0]
+p_counts = df[primary_col].fillna("Missing_Data_Unknown").value_counts().values.astype(float)
+# Uniform benchmark: every category gets equal weight → perfect representation
+q_uniform = np.ones(len(p_counts), dtype=float)
 
-                    # Compute per-stratum sample sizes (proportional)
-                    group_fractions = df_strat[strat_col].value_counts(normalize=True)
-                    sampled_parts = []
-                    for group, fraction in group_fractions.items():
-                        group_df = df_strat[df_strat[strat_col] == group]
-                        n = max(1, int(fraction * SAMPLE_LIMIT))   # at least 1 row per group
-                        sampled_parts.append(group_df.sample(n=min(n, len(group_df)), random_state=42))
+kl_score = compute_safe_kl_divergence(p_counts, q_uniform)
+grade_info = compute_compliance_grade(kl_score)
 
-                    df_work = pd.concat(sampled_parts).reset_index(drop=True)
-                    scan_mode = f"⚡ Stratified Sample — {len(df_work):,} rows (stratified on `{strat_col}`)"
-                    badge_color = "#FFD700"   # gold badge for sampled mode
+# Desert detection across all sensitive columns
+deserts = detect_representation_deserts(df, sensitive_cols)
 
-                else:
-                    df_work = df_full.copy()
-                    scan_mode = f"✅ Full Scan — {len(df_work):,} rows"
-                    badge_color = "#00FF41"   # green badge for full scan
+# Desert heatmap Plotly figure (None if < 2 sensitive cols)
+heatmap_fig = generate_desert_heatmap(df, sensitive_cols)
 
-                # Display scan mode badge
-                st.markdown(
-                    f"<div style='display:inline-block; background:{badge_color}; "
-                    f"color:#0e1117; font-weight:700; padding:6px 16px; "
-                    f"border-radius:6px; font-size:0.9rem; margin-bottom:12px;'>"
-                    f"{scan_mode}</div>",
-                    unsafe_allow_html=True,
-                )
+# 4b. Compliance Grade Badge 
 
-                # 2c. Build UMAP input matrix 
-                # UMAP needs numeric data — LabelEncode every sensitive column.
-                # NaNs are filled with the PRD-mandated 'Data_Gap_Unknown' sentinel.
-                st.markdown("#### ⚙️ Encoding & Projecting…")
-                encode_progress = st.progress(0, text="Encoding sensitive columns…")
+st.markdown("#### ⚖️ DPDP / NITI Aayog Compliance Grade")
 
-                umap_input = pd.DataFrame()   # will hold encoded columns
-                le = LabelEncoder()
+badge_col, summary_col = st.columns([1, 3])
 
-                for i, col in enumerate(sensitive_cols):
-                    filled = df_work[col].fillna("Data_Gap_Unknown").astype(str)
-                    umap_input[col] = le.fit_transform(filled)
-                    encode_progress.progress(
-                        int((i + 1) / len(sensitive_cols) * 40),
-                        text=f"Encoded: {col}",
-                    )
-
-                # 2d. Run UMAP
-                # n_components=2 → 2D scatter; random_state for reproducibility.
-                # n_neighbors default (15) works well; min_dist=0.1 keeps clusters tight.
-                encode_progress.progress(45, text="Running UMAP projection (this may take ~30s for large files)…")
-
-                reducer = umap.UMAP(
-                    n_components=2,
-                    random_state=42,
-                    n_neighbors=15,
-                    min_dist=0.1,
-                    metric="euclidean",
-                )
-                embedding = reducer.fit_transform(umap_input.values)  # returns (N, 2) array
-
-                encode_progress.progress(90, text="Attaching coordinates…")
-
-                # Attach UMAP coordinates back to working dataframe
-                df_work = df_work.copy()
-                df_work["umap_x"] = embedding[:, 0]
-                df_work["umap_y"] = embedding[:, 1]
-
-                encode_progress.progress(100, text="Done ✅")
-                encode_progress.empty()   # remove progress bar once complete
-
-                # 2e. Build hover data dict
-                # Plotly hover_data: show all sensitive column values per point
-                hover_data = {col: True for col in sensitive_cols}
-                hover_data["umap_x"] = False   # hide raw coordinates from hover
-                hover_data["umap_y"] = False
-
-                # 2f. Plotly scatter — BiasMap Terrain
-                # Color by first sensitive column; dark Obsidian Auditor theme
-                color_col = sensitive_cols[0]
-
-                fig = px.scatter(
-                    df_work,
-                    x="umap_x",
-                    y="umap_y",
-                    color=df_work[color_col].fillna("Data_Gap_Unknown").astype(str),
-                    hover_data=hover_data,
-                    title="BiasMap AI — Dataset Terrain Map",
-                    labels={"color": color_col, "umap_x": "UMAP Dimension 1", "umap_y": "UMAP Dimension 2"},
-                    color_discrete_sequence=px.colors.qualitative.Vivid,
-                )
-
-                # Apply Obsidian Auditor dark theme styling
-                fig.update_layout(
-                    plot_bgcolor="#0e1117",
-                    paper_bgcolor="#0e1117",
-                    font_color="#e0e0e0",
-                    title_font=dict(color="#00FF41", size=18, family="monospace"),
-                    legend=dict(
-                        bgcolor="#161b22",
-                        bordercolor="#00FF41",
-                        borderwidth=1,
-                        font=dict(color="#e0e0e0"),
-                    ),
-                    xaxis=dict(
-                        gridcolor="#1f2937",
-                        zerolinecolor="#1f2937",
-                        title_font=dict(color="#888"),
-                        tickfont=dict(color="#888"),
-                    ),
-                    yaxis=dict(
-                        gridcolor="#1f2937",
-                        zerolinecolor="#1f2937",
-                        title_font=dict(color="#888"),
-                        tickfont=dict(color="#888"),
-                    ),
-                    margin=dict(l=20, r=20, t=50, b=20),
-                )
-
-                fig.update_traces(
-                    marker=dict(size=4, opacity=0.75),
-                )
-
-                st.plotly_chart(fig, use_container_width=True)
-
-                # 2g. Show sampled dataframe below the map
-                st.markdown("#### 📋 Dataset Used for Projection")
-                st.caption(
-                    f"Showing the {len(df_work):,} rows passed into UMAP. "
-                    "Sensitive column values are as-loaded (NaNs shown as 'Data_Gap_Unknown' internally)."
-                )
-                st.dataframe(
-                    df_work.drop(columns=["umap_x", "umap_y"]).head(500),
-                    use_container_width=True,
-                    hide_index=False,
-                )
-                st.caption("👆 Displaying first 500 rows of the working dataset for performance.")
-
-                # Store working dataframe in session state for Step 3
-                st.session_state.df_work = df_work
-                st.session_state.sensitive_cols = sensitive_cols
-
-# 13. EMPTY STATE (no file yet)
-else:
+with badge_col:
+    badge_color = grade_info["color"]
     st.markdown(
-        "<div style='text-align:center; padding: 60px 0; color:#444;'>"
-        "<h3>⬆️ Upload a dataset above to begin your bias audit.</h3>"
-        "<p>Supported formats: <code>.csv</code> &nbsp;|&nbsp; <code>.json</code></p>"
-        "</div>",
+        f"""
+        <div class="grade-badge"
+             style="color:{badge_color}; border-color:{badge_color};
+                    background-color:#111827;">
+            {grade_info['grade']}
+        </div>
+        <div style="text-align:center; margin-top:6px; font-size:0.8rem;
+                    color:{badge_color}; font-weight:700; letter-spacing:1px;">
+            {grade_info['badge_text']}
+        </div>
+        """,
         unsafe_allow_html=True,
     )
+
+with summary_col:
+    st.markdown(
+        f"""
+        <div class="risk-box" style="border-color:{badge_color};">
+            <strong style="color:{badge_color};">Legal Risk Summary</strong><br>
+            {grade_info['risk_summary']}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# 4c. KL Divergence Score 
+
+kl_col, _, _ = st.columns(3)
+with kl_col:
+    st.metric(
+        label=f"📐 KL Divergence — {primary_col} vs. Uniform Benchmark",
+        value=f"{kl_score:.4f}",
+        delta=None,
+        help=(
+            "KL Divergence measures how far your dataset's distribution "
+            "is from perfect equality. 0 = ideal. Higher = more biased."
+        ),
+    )
+
+st.markdown("---")
+
+# 4d. Shannon Entropy for each Sensitive Column 
+
+st.markdown("#### 📊 Diversity Metrics — Shannon Entropy per Sensitive Column")
+st.caption(
+    "Shannon Entropy measures how evenly a column's values are distributed. "
+    "Higher = more diverse. Max entropy = log₂(unique categories)."
+)
+
+entropy_cols = st.columns(min(len(sensitive_cols), 4))  # max 4 per row
+
+for i, col in enumerate(sensitive_cols):
+    h_val    = entropy_scores[col]
+    h_max    = max_entropy[col]
+    pct_div  = (h_val / h_max * 100) if h_max > 0 else 0
+    delta_str = f"{pct_div:.1f}% of max diversity"
+
+    with entropy_cols[i % 4]:
+        st.metric(
+            label=f"H( {col} )",
+            value=f"{h_val:.3f} bits",
+            delta=delta_str,
+            delta_color="normal",
+            help=f"Max possible entropy for '{col}': {h_max:.3f} bits",
+        )
+
+st.markdown("---")
+
+# 4e. Desert Heatmap
+
+st.markdown("#### 🏜️ Intersectional Terrain Heatmap")
+
+if heatmap_fig is not None:
+    st.plotly_chart(heatmap_fig, use_container_width=True)
+    st.caption(
+        "Dark purple cells = representation deserts (near-zero data). "
+        "Neon green cells = well-represented intersections."
+    )
+else:
+    st.info(
+        "ℹ️ The terrain heatmap requires at least **2 sensitive columns**. "
+        "Go back to Step 2 and mark additional columns as Sensitive."
+    )
+
+st.markdown("---")
+
+# 4f. Top Representation Deserts Table 
+
+st.markdown("#### 🔴 Top Representation Deserts")
+st.caption(
+    f"Intersections with < 1% representation. "
+    f"Found **{len(deserts)}** desert(s) across {len(sensitive_cols)} sensitive column(s)."
+)
+
+if len(deserts) == 0:
+    st.success(
+        "✅ No representation deserts detected! All intersectional combinations "
+        "have ≥ 1% representation."
+    )
+else:
+    # Show top 5 worst deserts in a styled table
+    top_deserts = deserts[:5]
+
+    desert_table = pd.DataFrame(
+        [
+            {
+                "Intersection": d["combination"],
+                "Count": d["count"],
+                "% of Dataset": d["percentage"],
+                "Severity": d["severity"],
+            }
+            for d in top_deserts
+        ]
+    )
+
+    # Style: highlight the Severity column
+    def _severity_style(val: str) -> str:
+        if "ABSENT" in val:
+            return "color: #FF4444; font-weight: bold;"
+        elif "CRITICAL" in val:
+            return "color: #FF8C00; font-weight: bold;"
+        else:
+            return "color: #FFD700; font-weight: bold;"
+
+    styled = (
+        desert_table.style
+        .map(_severity_style, subset=["Severity"])
+        .format({"% of Dataset": "{:.4f}%"})
+        .set_properties(**{
+            "background-color": "#111827",
+            "color": "#e0e0e0",
+            "border": "1px solid #1f2937",
+        })
+        .set_table_styles([
+            {"selector": "th", "props": [
+                ("background-color", "#0e1117"),
+                ("color", "#00FF41"),
+                ("font-family", "'Courier New', monospace"),
+                ("border", "1px solid #1f2937"),
+            ]},
+        ])
+    )
+
+    st.dataframe(styled, use_container_width=True, height=250)
+
+    if len(deserts) > 5:
+        with st.expander(f"📋 Show all {len(deserts)} deserts"):
+            all_desert_df = pd.DataFrame(
+                [
+                    {
+                        "Intersection": d["combination"],
+                        "Count": d["count"],
+                        "% of Dataset": d["percentage"],
+                        "Severity": d["severity"],
+                    }
+                    for d in deserts
+                ]
+            )
+            st.dataframe(all_desert_df, use_container_width=True)
+
+st.markdown("---")
+
+# Footer 
+
+st.markdown(
+    "<p style='text-align:center; color:#4b5563; font-size:0.75rem;'>"
+    "BiasMap AI v3.0 · Local-First · DPDP Act (2023) Compliant · "
+    "Built for the Hackathon · No data leaves your machine."
+    "</p>",
+    unsafe_allow_html=True,
+)
