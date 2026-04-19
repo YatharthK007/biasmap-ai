@@ -313,12 +313,178 @@ if uploaded_file is not None:
                 )
 
             st.markdown("---")
-            # 12. ANALYSIS PLACEHOLDER
-            st.info(
-                "🔬 Analysis will appear here — "
-                "Cartography Engine, Audit Engine, Mitigation & Ghost Bias are coming in Steps 2–5.",
-                icon="⚙️",
-            )
+            
+            # STEP 2: CARTOGRAPHY ENGINE
+            # Runs after schema is confirmed. Encodes sensitive cols → UMAP → Plotly map.
+
+            import umap                                     # dimensionality reduction
+            from sklearn.preprocessing import LabelEncoder  # encode categorical → numeric
+            import plotly.express as px                     # interactive scatter plot
+
+            st.markdown("## 🗺️ Terrain Map — Bias Cartography Engine")
+            st.markdown("---")
+
+            # 2a. Identify sensitive columns from confirmed schema
+            sensitive_cols = [
+                col for col, role in st.session_state.schema.items()
+                if role == "Sensitive"
+            ]
+
+            if not sensitive_cols:
+                st.error("❌ No Sensitive columns found in schema. Go back and mark at least one.")
+            else:
+                # 2b. Stratified sampling gate
+                # PRD requirement: datasets > 100k rows must be sampled to prevent
+                # UMAP memory overflow
+                SAMPLE_LIMIT = 100_000
+                df_full = st.session_state.df   # original full dataframe
+
+                if len(df_full) > SAMPLE_LIMIT:
+                    # Stratify by the first sensitive column so minority groups
+                    # are proportionally preserved in the sample
+                    strat_col = sensitive_cols[0]
+
+                    # Fill NaNs in strat column so groupby doesn't drop rows
+                    df_strat = df_full.copy()
+                    df_strat[strat_col] = df_strat[strat_col].fillna("Data_Gap_Unknown")
+
+                    # Compute per-stratum sample sizes (proportional)
+                    group_fractions = df_strat[strat_col].value_counts(normalize=True)
+                    sampled_parts = []
+                    for group, fraction in group_fractions.items():
+                        group_df = df_strat[df_strat[strat_col] == group]
+                        n = max(1, int(fraction * SAMPLE_LIMIT))   # at least 1 row per group
+                        sampled_parts.append(group_df.sample(n=min(n, len(group_df)), random_state=42))
+
+                    df_work = pd.concat(sampled_parts).reset_index(drop=True)
+                    scan_mode = f"⚡ Stratified Sample — {len(df_work):,} rows (stratified on `{strat_col}`)"
+                    badge_color = "#FFD700"   # gold badge for sampled mode
+
+                else:
+                    df_work = df_full.copy()
+                    scan_mode = f"✅ Full Scan — {len(df_work):,} rows"
+                    badge_color = "#00FF41"   # green badge for full scan
+
+                # Display scan mode badge
+                st.markdown(
+                    f"<div style='display:inline-block; background:{badge_color}; "
+                    f"color:#0e1117; font-weight:700; padding:6px 16px; "
+                    f"border-radius:6px; font-size:0.9rem; margin-bottom:12px;'>"
+                    f"{scan_mode}</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # 2c. Build UMAP input matrix 
+                # UMAP needs numeric data — LabelEncode every sensitive column.
+                # NaNs are filled with the PRD-mandated 'Data_Gap_Unknown' sentinel.
+                st.markdown("#### ⚙️ Encoding & Projecting…")
+                encode_progress = st.progress(0, text="Encoding sensitive columns…")
+
+                umap_input = pd.DataFrame()   # will hold encoded columns
+                le = LabelEncoder()
+
+                for i, col in enumerate(sensitive_cols):
+                    filled = df_work[col].fillna("Data_Gap_Unknown").astype(str)
+                    umap_input[col] = le.fit_transform(filled)
+                    encode_progress.progress(
+                        int((i + 1) / len(sensitive_cols) * 40),
+                        text=f"Encoded: {col}",
+                    )
+
+                # 2d. Run UMAP
+                # n_components=2 → 2D scatter; random_state for reproducibility.
+                # n_neighbors default (15) works well; min_dist=0.1 keeps clusters tight.
+                encode_progress.progress(45, text="Running UMAP projection (this may take ~30s for large files)…")
+
+                reducer = umap.UMAP(
+                    n_components=2,
+                    random_state=42,
+                    n_neighbors=15,
+                    min_dist=0.1,
+                    metric="euclidean",
+                )
+                embedding = reducer.fit_transform(umap_input.values)  # returns (N, 2) array
+
+                encode_progress.progress(90, text="Attaching coordinates…")
+
+                # Attach UMAP coordinates back to working dataframe
+                df_work = df_work.copy()
+                df_work["umap_x"] = embedding[:, 0]
+                df_work["umap_y"] = embedding[:, 1]
+
+                encode_progress.progress(100, text="Done ✅")
+                encode_progress.empty()   # remove progress bar once complete
+
+                # 2e. Build hover data dict
+                # Plotly hover_data: show all sensitive column values per point
+                hover_data = {col: True for col in sensitive_cols}
+                hover_data["umap_x"] = False   # hide raw coordinates from hover
+                hover_data["umap_y"] = False
+
+                # 2f. Plotly scatter — BiasMap Terrain
+                # Color by first sensitive column; dark Obsidian Auditor theme
+                color_col = sensitive_cols[0]
+
+                fig = px.scatter(
+                    df_work,
+                    x="umap_x",
+                    y="umap_y",
+                    color=df_work[color_col].fillna("Data_Gap_Unknown").astype(str),
+                    hover_data=hover_data,
+                    title="BiasMap AI — Dataset Terrain Map",
+                    labels={"color": color_col, "umap_x": "UMAP Dimension 1", "umap_y": "UMAP Dimension 2"},
+                    color_discrete_sequence=px.colors.qualitative.Vivid,
+                )
+
+                # Apply Obsidian Auditor dark theme styling
+                fig.update_layout(
+                    plot_bgcolor="#0e1117",
+                    paper_bgcolor="#0e1117",
+                    font_color="#e0e0e0",
+                    title_font=dict(color="#00FF41", size=18, family="monospace"),
+                    legend=dict(
+                        bgcolor="#161b22",
+                        bordercolor="#00FF41",
+                        borderwidth=1,
+                        font=dict(color="#e0e0e0"),
+                    ),
+                    xaxis=dict(
+                        gridcolor="#1f2937",
+                        zerolinecolor="#1f2937",
+                        title_font=dict(color="#888"),
+                        tickfont=dict(color="#888"),
+                    ),
+                    yaxis=dict(
+                        gridcolor="#1f2937",
+                        zerolinecolor="#1f2937",
+                        title_font=dict(color="#888"),
+                        tickfont=dict(color="#888"),
+                    ),
+                    margin=dict(l=20, r=20, t=50, b=20),
+                )
+
+                fig.update_traces(
+                    marker=dict(size=4, opacity=0.75),
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                # 2g. Show sampled dataframe below the map
+                st.markdown("#### 📋 Dataset Used for Projection")
+                st.caption(
+                    f"Showing the {len(df_work):,} rows passed into UMAP. "
+                    "Sensitive column values are as-loaded (NaNs shown as 'Data_Gap_Unknown' internally)."
+                )
+                st.dataframe(
+                    df_work.drop(columns=["umap_x", "umap_y"]).head(500),
+                    use_container_width=True,
+                    hide_index=False,
+                )
+                st.caption("👆 Displaying first 500 rows of the working dataset for performance.")
+
+                # Store working dataframe in session state for Step 3
+                st.session_state.df_work = df_work
+                st.session_state.sensitive_cols = sensitive_cols
 
 # 13. EMPTY STATE (no file yet)
 else:
