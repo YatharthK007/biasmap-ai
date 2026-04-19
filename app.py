@@ -11,6 +11,8 @@ from mitigation import (
     run_ghost_bias_simulation,
     compute_entropy_gain,
 )
+from report import generate_pdf_report
+
 
 # Importing all audit functions from the local auditor module
 from auditor import (
@@ -463,6 +465,11 @@ else:
  
                     # Persist fixed df in session so report.py can use it
                     st.session_state["df_fixed"] = df_fixed
+
+                    # Save mitigation metadata for the PDF report
+                    st.session_state["fix_method_used"]   = fix_method
+                    st.session_state["entropy_before_val"] = e_before
+                    st.session_state["entropy_after_val"]  = e_after
  
                     st.success(
                         f"✅ Mitigation complete! Fixed dataset has "
@@ -722,3 +729,60 @@ st.markdown(
     "</p>",
     unsafe_allow_html=True,
 )
+
+# STEP 5: EXPORT — Data Nutrition Label PDF 
+
+st.markdown("### 📄 Step 5 — Export Data Nutrition Label")
+st.caption(
+    "Generates a 3-page PDF audit report you can share with regulators, "
+    "team leads, or include in your model card."
+)
+
+
+if st.button("📥 Generate & Download Data Nutrition Label", type="primary"):
+    # Collect ghost bias from session if available, else empty dict
+    ghost_bias_data: dict = {}
+    try:
+        # Rerun ghost bias silently to get the data for the PDF
+        if target_col and sensitive_cols:
+            from mitigation import run_ghost_bias_simulation
+            ghost_bias_data = run_ghost_bias_simulation(df, sensitive_cols, target_col)
+    except Exception:
+        ghost_bias_data = {}
+
+    # Collect mitigation data from session state 
+    fix_applied    = "df_fixed" in st.session_state
+    fix_method_val = st.session_state.get("fix_method_used", None)
+    e_before_val   = st.session_state.get("entropy_before_val", None)
+    e_after_val    = st.session_state.get("entropy_after_val", None)
+
+    with st.spinner("📝 Generating Data Nutrition Label PDF…"):
+        try:
+            from report import generate_pdf_report
+
+            pdf_bytes = generate_pdf_report(
+                dataset_name      = uploaded_file.name,
+                row_count         = df.shape[0],
+                col_count         = df.shape[1],
+                sensitive_cols    = sensitive_cols,
+                compliance_result = grade_info,
+                entropy_scores    = entropy_scores,
+                kl_score          = kl_score,
+                deserts           = deserts,
+                ghost_bias        = ghost_bias_data,
+                fix_applied       = fix_applied,
+                fix_method        = fix_method_val,
+                entropy_before    = e_before_val,
+                entropy_after     = e_after_val,
+            )
+
+            st.download_button(
+                label     = "⬇️ Download BiasMap_Audit_Report.pdf",
+                data      = pdf_bytes,
+                file_name = "BiasMap_Audit_Report.pdf",
+                mime      = "application/pdf",
+            )
+            st.success("✅ PDF ready! Click the button above to download.")
+
+        except Exception as exc:
+            st.error(f"PDF generation failed: {exc}")
