@@ -3,6 +3,14 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import umap 
+import streamlit as st
+import plotly.graph_objects as go
+from mitigation import (
+    apply_smote,
+    apply_undersampling,
+    run_ghost_bias_simulation,
+    compute_entropy_gain,
+)
 
 # Importing all audit functions from the local auditor module
 from auditor import (
@@ -353,6 +361,220 @@ with summary_col:
     )
 
 st.markdown("<br>", unsafe_allow_html=True)
+
+grade = grade_info["grade"]
+
+# Neon-green palette constants
+NEON   = "#00FF41"
+BG     = "#0e1117"
+CARD   = "#161b22"
+ 
+
+# AUTO-FIX SECTION
+
+st.markdown("---")
+st.markdown(
+    "<h2 style='color:#00FF41;'>⚡ Auto-Fix & Ghost Bias Detector</h2>",
+    unsafe_allow_html=True,
+)
+ 
+# Grades that trigger the fix panel
+BAD_GRADES  = {"C", "D", "F"}
+GOOD_GRADES = {"A+", "A", "B"}
+ 
+if grade in GOOD_GRADES:
+    # Dataset is already healthy — no fix needed
+    st.success(
+        f"✅ **Grade {grade} — No Mitigation Needed.** "
+        "Your dataset meets the fairness threshold. "
+        "Review the Ghost Bias chart below for transparency."
+    )
+else:
+    # Show fix panel for C / D / F
+    st.warning(
+        f"⚠️ **Grade {grade} detected.** "
+        "Apply an Auto-Fix to improve data diversity before training."
+    )
+ 
+    # Let user pick a mitigation strategy
+    fix_method = st.radio(
+        "Select Mitigation Strategy",
+        options=["SMOTE (Synthetic Over-sampling)", "Strategic Under-sampling"],
+        horizontal=True,
+        help=(
+            "SMOTE creates synthetic minority samples. "
+            "Under-sampling prunes the majority class — no fabricated data."
+        ),
+    )
+ 
+    # Require at least one sensitive column for under-sampling
+    if fix_method == "Strategic Under-sampling" and not sensitive_cols:
+        st.error(
+            "No Sensitive columns marked. "
+            "Go back to the Schema screen and mark at least one column as Sensitive."
+        )
+    elif fix_method == "SMOTE (Synthetic Over-sampling)" and not target_col:
+        st.error(
+            "SMOTE requires a Target column. "
+            "Go back to the Schema screen and mark one column as Target."
+        )
+    else:
+        run_fix = st.button("🚀 Run Auto-Fix", use_container_width=True)
+ 
+        if run_fix:
+            with st.spinner("Running mitigation engine…"):
+                try:
+                    if fix_method == "SMOTE (Synthetic Over-sampling)":
+                        df_fixed, e_before, e_after = apply_smote(df, target_col)
+                        used_col = target_col
+                    else:
+                        # Use first sensitive col for under-sampling pivot
+                        pivot_col = sensitive_cols[0]
+                        df_fixed, e_before, e_after = apply_undersampling(
+                            df, pivot_col
+                        )
+                        used_col = pivot_col
+ 
+                    gain = compute_entropy_gain(e_before, e_after)
+ 
+                    # Entropy metrics side-by-side
+                    st.markdown(
+                        "<h4 style='color:#00FF41;'>Shannon Entropy: Before vs After</h4>",
+                        unsafe_allow_html=True,
+                    )
+                    col_before, col_after, col_gain = st.columns(3)
+ 
+                    with col_before:
+                        st.metric(
+                            label="🔴 Entropy Before",
+                            value=f"{e_before:.4f} bits",
+                        )
+                    with col_after:
+                        st.metric(
+                            label="🟢 Entropy After",
+                            value=f"{e_after:.4f} bits",
+                            delta=f"{e_after - e_before:+.4f} bits",
+                        )
+                    with col_gain:
+                        st.metric(
+                            label="📈 Entropy Gain",
+                            value=f"{gain:+.2f}%",
+                        )
+ 
+                    # Persist fixed df in session so report.py can use it
+                    st.session_state["df_fixed"] = df_fixed
+ 
+                    st.success(
+                        f"✅ Mitigation complete! Fixed dataset has "
+                        f"**{len(df_fixed):,} rows** "
+                        f"(was {len(df):,}). "
+                        "Download or continue to the PDF Report."
+                    )
+ 
+                    # Quick preview of the fixed dataset
+                    with st.expander("Preview Fixed Dataset (first 50 rows)"):
+                        st.dataframe(df_fixed.head(50), use_container_width=True)
+ 
+                except Exception as exc:
+                    st.error(f"Auto-Fix failed: {exc}")
+ 
+ 
+
+# GHOST BIAS CHART — always visible, regardless of grade
+
+st.markdown(
+    "<h3 style='color:#00FF41; margin-top:2rem;'>"
+    "👻 Ghost Bias Detector</h3>",
+    unsafe_allow_html=True,
+)
+st.caption(
+    "Which column drives skewed predictions? "
+    "Trained on a shallow Decision Tree (max_depth=4) — "
+    "higher bar = stronger proxy bias."
+)
+ 
+if not target_col:
+    # User hasn't selected a target — friendly prompt
+    st.info(
+        "ℹ️ **Select a Target column in the Schema screen** "
+        "to enable the Ghost Bias simulation."
+    )
+elif not sensitive_cols:
+    st.info(
+        "ℹ️ **Mark at least one Sensitive column in the Schema screen** "
+        "to run the Ghost Bias simulation."
+    )
+else:
+    with st.spinner("Training Ghost Bias shadow model…"):
+        try:
+            importances = run_ghost_bias_simulation(df, sensitive_cols, target_col)
+ 
+            if not importances:
+                st.warning("No feature importances returned — check your columns.")
+            else:
+                cols_sorted   = list(importances.keys())
+                scores_sorted = list(importances.values())
+ 
+                # Horizontal bar chart — neon green on dark bg
+                fig = go.Figure(
+                    go.Bar(
+                        x=scores_sorted,
+                        y=cols_sorted,
+                        orientation="h",
+                        marker=dict(
+                            color=NEON,
+                            line=dict(color=NEON, width=1),
+                        ),
+                        text=[f"{s:.4f}" for s in scores_sorted],
+                        textposition="outside",
+                        textfont=dict(color=NEON, size=11),
+                        hovertemplate=(
+                            "<b>%{y}</b><br>"
+                            "Gini Importance: %{x:.4f}<extra></extra>"
+                        ),
+                    )
+                )
+ 
+                fig.update_layout(
+                    title=dict(
+                        text=(
+                            "Ghost Bias Detector — "
+                            "Which column drives skewed predictions?"
+                        ),
+                        font=dict(color=NEON, size=15),
+                    ),
+                    paper_bgcolor=BG,
+                    plot_bgcolor=CARD,
+                    xaxis=dict(
+                        title="Gini Importance Score",
+                        title_font=dict(color="#AAAAAA"),
+                        tickfont=dict(color="#AAAAAA"),
+                        gridcolor="#1e2a1e",
+                        range=[0, max(scores_sorted) * 1.25],  # breathing room
+                    ),
+                    yaxis=dict(
+                        tickfont=dict(color=NEON),
+                        autorange="reversed",  # highest importance at top
+                    ),
+                    margin=dict(l=20, r=40, t=60, b=40),
+                    height=max(300, len(cols_sorted) * 55),  # scale with rows
+                )
+ 
+                st.plotly_chart(fig, use_container_width=True)
+ 
+                # Highlight the single biggest culprit
+                top_col   = cols_sorted[0]
+                top_score = scores_sorted[0]
+                st.markdown(
+                    f"<p style='color:#FF4B4B; font-weight:bold;'>"
+                    f"🚨 Highest proxy bias: <code>{top_col}</code> "
+                    f"(Gini Importance = {top_score:.4f}). "
+                    f"This column may act as a proxy for a protected attribute.</p>",
+                    unsafe_allow_html=True,
+                )
+ 
+        except Exception as exc:
+            st.error(f"Ghost Bias simulation failed: {exc}")
 
 # 4c. KL Divergence Score 
 
